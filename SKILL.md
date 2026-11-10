@@ -331,3 +331,36 @@ dotnet ilspycmd\tools\net8.0\any\ilspycmd.dll -p -o src "CG红包接龙通用版
 | 2014 | `SubDelay` | 补救延迟，**定义了但从未调用**（死代码） |
 | 1150 | `AutoChangeRoom` | 换房（匹配目标桌号，5 次不中则停机） |
 | 1193 | `HeartbeatCheck` / `CheckOffline` | 心跳与掉线判定 |
+
+---
+
+## 14. 实测进展（headless 落地记录）
+
+### 14.1 单号闭环（已验证）
+
+用参考实现 `engine.js` 作传输层 + 直连，实测 55 秒 6 次抢包：
+
+```
+公告→抢到：246 / 247 / 269 / 272 / 273 ms（中位 269ms，最小 246ms）
+成功 5/6，实收 2.38 / 1.99 / 1.66 / 2.85 / 6.08 元
+```
+
+拆分：`room/grab` API 本身 105ms，其余是聊天广播投递（约 120~140ms）+ 本地 TCP 派发（≤10ms）。
+
+### 14.2 三号同桌（已验证）
+
+headless 下 `change`（logoutRoom+join）只要 ~400ms，三个进程反复撞房间，**4 秒内即可同落一桌**（浏览器方案要 60~180 秒）。
+
+### 14.3 三个硬坑（踩到了，附成因）
+
+| 坑 | 现象 | 成因 |
+|---|---|---|
+| 聊天走代理必挂 | NIM 登录 15s 超时，chatroom 拿不到 `chatroomAddresses` | NIM 的 WebSocket/fetch 经 undici+socks 隧道不稳；**聊天必须直连**，只有游戏 API 走代理 |
+| 进房后立刻抢 → SDK panic | `RuntimeError: stack overflow`，之后所有抢包 500 | wasm 单线程，进房/聊天回调未完全落稳就进 Go；**进房后 1.5s 内的包要跳过**，panic 后必须重启该窗口进程 |
+| undici 8 + socks 连不上 | `An invalid destination host was provided` / 「网络链接失败」 | undici 8 的 connector 传的是 `{origin,port}` 而非 `hostname`；需要用 origin 解析出 host:port（本仓库 SKILL 第 4 节已给修正写法） |
+
+### 14.4 工具
+
+- `tools/engine2.js` —— 自建沙箱宿主（vm + Go/WASM + 串行队列 + TCP 指令 + roomID 过滤）
+- `tools/ctrl.js` —— 控制器（多引擎编排 + 同桌 + 判定规则 + 崩溃自愈）
+- `tools/probe_grab.cjs` —— 单号闭环测速（公告→出手→结果）
