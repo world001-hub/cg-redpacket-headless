@@ -1,4 +1,4 @@
----
+﻿---
 name: cg-redpacket-headless
 description: 红包接龙（Cocos H5 前端 + Go/WASM 游戏 SDK + 云信 NIM 聊天室）的 headless 抢包方案。核心是把游戏自己的 sdk.wasm 放进 Node 的 vm 沙箱里直接跑（完全不启动浏览器），网络层用 undici(HTTP/2)+SOCKS5，聊天室只开一个实例、把红包事件通过 TCP 指令通道广播给其它窗口，抢包请求按「公告自带的 roomID」下发，所有 SDK 调用串行化。文档包含参考实现「CG红包接龙通用版」的完整解构（engine.js 27KB + 控制器 exe + 依赖清单）、抢包判定逻辑（余额最高首抢 / 余额最低收尾 / 逻辑金额 / 补救延迟 / 休止节奏）、该平台真实 API 契约（t=1 开包 / t=2 领取 / t=3 结算，消息体带 roomID）、以及六个必踩的坑（2 分钟未抢包被重分房间、join 回显房间号不可信、多聊天室实例互踢、WASM 并发调用越界即报废、代理出口 IP 与登录 IP 必须一致、页面白屏）。当用户要做红包接龙/抢红包自动化、复现 headless 抢包、分析同类 H5 小游戏 SDK 宿主方案、或排查「同桌完成却抢不到」时加载。
 whenToUse: 用户要求实现/复现红包接龙自动抢包；要把浏览器方案换成 headless；需要该平台 SDK 的 Node 宿主引导代码；需要排查 500「不在本房间」/510「超过2分钟未抢包」/SDK 卡死；需要把抢包逻辑固化成技能复用。
@@ -169,29 +169,69 @@ chatroomChat.on('chatroomMsg', (a) => {
 
 ---
 
-## 7. 抢包判定逻辑（控制器侧）
+## 7. 抢包判定逻辑（**已反编译控制器 exe 得到，非推测**）
 
-角色（每期重算，按余额）：
+反编译产物：`MainForm.cs` 2511 行（ILSpy 9.0 反编译，命令见第 12 节）。
+核心三处：`HandleNewBag`(1687) 选角色 → `TryGrab`(1991) 下发 → `HandleGrabRes`(2050) 逐刀判定。
 
-| 角色 | 选取 | 行为 |
-|---|---|---|
-| 首抢 | 余额**最高** | 新包公告一到立刻抢（页面/引擎内直接发） |
-| 2 抢 | 余下中间的那个（或"余额最低 2 抢"模式） | 首抢结果 a1 判定通过后出手 |
-| 尾包 | 余额**最低**，"只抢最后一包" | 只在第 2 刀之后出手 |
+### 7.1 角色分配（每包重算）
 
-判定链（与用户给的规则一致）：
-
-```
-A 抢 → a1
-├─ a1 ≥ 包赢线（≈(9.5−a1)/2 的临界 3.17；参考实现把上限放到 7）→ B、C 都不抢
-├─ a1 ≤ 必输线（逻辑金额 2.9）→ B、C 把剩下两刀全抢（此时注定最低，能收多少收多少）
-└─ 中间 → B 抢 → a2
-     ├─ 尾包 < 逻辑金额            → C 不抢
-     ├─ 我们最小 > 尾包            → C 不抢（陌生人拿尾包当最低，他发下包）
-     └─ 否则                      → C 抢（我们本来就是最低，不抢等于白送）
+```csharp
+// 首抢
+firstMode==4 : 余额最高          // "余额最高首抢"
+firstMode==2 : array[circNext++] // "循环首抢"
+firstMode==3 : fixedFirstIdx     // 固定；不在线则随机
+default      : array[0]
+// 2 抢
+if (chkBalLowSecond) w2 = 除首抢外余额最低; else w2 = fixed2Idx（与首抢重复则取消）
+// 尾包
+if (chkBalLowLast)   w5 = 排除首抢/2抢后余额最低; else w5 = lastGrabIdx（固定抢尾）
+// 剩余窗口：洗牌后依次填 w3(w4)
 ```
 
-参数（控制器 UI 同名）：`逻辑金额=2.9`、`补救延迟ms=50`、`止损=20`、休止 `抢一停一/抢一停二/抢二停二`、`循环首抢`、`余额最高首抢`、`余额最低收尾`、`固定第二抢`、`固定抢尾`、`多开(N)`。
+三包房要求可用窗口 ≥ 3，否则 `autoGrab=false` 直接停机。
+
+### 7.2 下发前的双重校验（这就是「不在本房间」的防线）
+
+```csharp
+private bool TryGrab(int slot, long id, GrabRound r) {
+    if (engState[slot] != "joined") return false;                 // 引擎必须已进房
+    long room; long.TryParse(eng[slot].Room, out room);
+    if (r.bagRoom > 0 && room > 0 && room != r.bagRoom) {         // ★ 引擎当前房号 ≠ 包所属房号 → 跳过
+        MasterLog("窗口.. 桌号" + room + " ≠ 红包桌" + r.bagRoom + " → 跳过抢 " + id);
+        return false;
+    }
+    SendTo(slot, "{\"cmd\":\"grab\",\"id\":" + id + "}");
+}
+```
+
+`bagRoom` 来自**开包公告里的 `roomID`**，不是 join 回显。
+
+### 7.3 逐刀判定（phase 状态机，三包房）
+
+```
+phase0: 首抢 → 失败=本包结束（不补刀）
+              成功 m1:  if (m1 >= 逻辑金额) 结束        ← B、C 都不抢
+                        else phase=1 → 下发 w2
+phase1: 2 抢 → 失败=结束
+              成功 m2:  剩余 = bagMoney − m1 − m2
+                        if (剩余 < min(m1,m2)) 结束      ← 陌生人拿尾包当最低
+                        else phase=2 → 下发 w5（尾包）
+phase2: 尾包 → 拿到即结束；失败结束
+```
+
+五包房同理，但用 **剩余/剩余坑数** 与当前最小比较（`num4/(bagCount-2) < num6`）。
+
+### 7.4 与用户规则的三处差异（重要）
+
+| 项 | 参考实现（反编译实证） | 我们当前实现 | 结论 |
+|---|---|---|---|
+| a1 停手阈值 | **`m1 >= 逻辑金额(2.9)`** | 3.17（数学包赢临界） | 2.9 在 2.9~3.17 区间会让两个陌生人分掉剩余而他们都 > a1 → **我们反而成最低**。3.17 更稳 |
+| 尾包阈值 | 只用 `剩余 < min(m1,m2)`，**不再看 2.9** | 同 | 一致 |
+| 失败补刀 | **没有**，抢失败即放弃本包 | 有 keepalive / 全抢 | 参考实现更保守 |
+| `SubDelay()`（补救延迟） | **定义了但从未被调用**（死代码） | 我们曾用它做延迟 | 可忽略 |
+
+结论：**判定骨架与我们一致，唯一实质差异是 a1 的阈值取 2.9 还是 3.17**。建议保留 3.17（等于参考实现的阈值 + 数学保护）。
 
 ---
 
@@ -261,3 +301,33 @@ node tcpcli.cjs 9100 join 25000
 | 代理走本地 HTTP 中继 | undici dispatcher + socks |
 
 迁移时**保留判定规则与面板**，只换传输层。
+
+
+---
+
+## 13. 反编译参考控制器（可复现）
+
+控制器 `CG红包接龙通用版.exe` 是 **.NET Framework WinForms** 程序（PE32 + CLR header，50KB）。
+用 ILSpy 命令行即可完整还原 C#：
+
+```powershell
+# 1) 下载 ILSpy 命令行（nuget 包解压即可，无需安装 SDK）
+Invoke-WebRequest https://www.nuget.org/api/v2/package/ilspycmd/9.0.0.7889 -OutFile ilspycmd.zip
+Expand-Archive ilspycmd.zip -DestinationPath ilspycmd
+# 2) 反编译（本机已有 .NET 8 运行时）
+dotnet ilspycmd\tools\net8.0\any\ilspycmd.dll -p -o src "CG红包接龙通用版.exe"
+```
+
+产物：`MainForm.cs`(62.7KB/2511 行)、`EngineClient.cs`、`J.cs`、`Program.cs`、`PromptForm.cs`。
+本仓库 `reference/decompiled/` 已放入 `MainForm.cs` 与 `EngineClient.cs` 作为证据。
+
+关键行号导航：
+
+| 行号 | 方法 | 作用 |
+|---|---|---|
+| 1687 | `HandleNewBag` | 新包：止损检查 → 选首抢/2抢/尾包 → 下发首抢 |
+| 1991 | `TryGrab` | 下发前校验：engine 已进房 + **当前房号 == 包房号** |
+| 2050 | `HandleGrabRes` | phase 状态机：a1 判 `>= 逻辑金额` 停；a2 判 `剩余 < min(m1,m2)` 停 |
+| 2014 | `SubDelay` | 补救延迟，**定义了但从未调用**（死代码） |
+| 1150 | `AutoChangeRoom` | 换房（匹配目标桌号，5 次不中则停机） |
+| 1193 | `HeartbeatCheck` / `CheckOffline` | 心跳与掉线判定 |
