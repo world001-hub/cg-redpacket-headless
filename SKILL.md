@@ -364,3 +364,33 @@ headless 下 `change`（logoutRoom+join）只要 ~400ms，三个进程反复撞�
 - `tools/engine2.js` —— 自建沙箱宿主（vm + Go/WASM + 串行队列 + TCP 指令 + roomID 过滤）
 - `tools/ctrl.js` —— 控制器（多引擎编排 + 同桌 + 判定规则 + 崩溃自愈）
 - `tools/probe_grab.cjs` —— 单号闭环测速（公告→出手→结果）
+
+### 14.5 三条新链接实测（2026-11-10 23:0x，直连单号）
+
+| 链接 | API 主机 | 结果 |
+|---|---|---|
+| cocos.hqclib.com | h5-api.chicsom.com | 5 中 4，中位 275ms（237~278） |
+| cocos.tfwunrn.com | h5-api.dbc1904.com | 5 中 4，中位 274ms（226~288） |
+| cocos.qourqd.com | h5-api.qptrcl.com | **6 中 6**，中位 274ms（241~311） |
+
+### 14.6 三号同桌（headless，新链接）
+
+- 三个进程 `change` 撞房间，**4~6 秒同桌**（浏览器方案要 60~180 秒）。
+- 角色按轮转分配（不查余额，避免 `getUserMoney` 打崩 wasm）。
+
+### 14.7 已修的关键 bug：聊天窗口抢包 stack overflow
+
+**症状**：slot=1（聊天所在进程）在公告后 1~8ms 内直接 grab → `panic: runtime error: stack overflow`，此后该进程所有抢包回 500「不在本房间」。
+
+**修法**：聊天窗口出手前**让出 120ms**（`setTimeout(fire, 120)`），等聊天回调从 Go 栈上退干净。
+
+**验证**：修复后连续抢到 `7.17`（383ms）、`5.37`（379ms），不再 panic。
+
+**另一条**：只有 `memory access out of bounds` 才需要重启进程；`stack overflow` 是偶发，重启反而会陷入「每次重开首抢必 panic」的死循环。
+
+### 14.8 当前卡点：SOCKS5 代理不稳定
+
+- 两个代理（`123.126.74.197` / `183.192.164.249`）出口 IP 不固定/间歇不可达。
+- 表现：代理窗口 join 成功（桌号正确），抢包回 `500 您不在本房间` —— 服务端按 IP 绑定座位，出口 IP 一变就失效。
+- 本机只有一个真实网卡 IP（192.168.2.170），无法用 BIND_IP 做多出口。
+- **结论：三号三刀必须三条稳定（同 IP 长会话）的出口。**

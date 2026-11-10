@@ -39,7 +39,7 @@ function startEngine(a) {
     const s = d.toString(); out += s;
     for (const line of s.split('\n')) {
       if (!line.trim()) continue;
-      if (/SDK已损坏|panic:/.test(line)) {
+      if (/out of bounds/i.test(line)) {
         log(a.name + ' 引擎异常（' + line.slice(0, 60) + '）→ 重启该窗口');
         a.state = 'dead'; a.room = null;
         try { a.proc.kill(); } catch (e) {}
@@ -88,15 +88,17 @@ const rounds = new Map();   // id -> { id, room, annT, phase, m1, m2, w1, w2, w3
 
 function pickRoles(room) {
   const pool = accs.filter((a) => (a.state === 'connected' || a.state === 'joined') && String(a.room) === String(room));
-  if (!pool.length) return null;
-  const byBal = [...pool].sort((x, y) => y.balance - x.balance);
-  return { first: byBal[0], second: byBal[1] || null, tail: byBal[byBal.length - 1] !== byBal[0] ? byBal[byBal.length - 1] : (byBal[2] || null) };
+  if (pool.length < 2) return null;
+  const rot = (global.__rot = ((global.__rot || 0) + 1) % pool.length);
+  const order = pool.slice(rot).concat(pool.slice(0, rot));
+  return { first: order[0], second: order[1] || null, tail: order[pool.length - 1] !== order[0] ? order[pool.length - 1] : (order[1] || null) };
 }
 
 function sendGrab(a, id, why) {
   const r = rounds.get(String(id));
   if (r) { r.sentAt = Date.now(); r.lastWho = a.name; }
-  a.sock.write(JSON.stringify({ cmd: 'grab', id: Number(id) }) + '\n');
+  const fire = () => { try { a.sock.write(JSON.stringify({ cmd: 'grab', id: Number(id) }) + '\n'); } catch (e) {} };
+  if (a.slot === '1') setTimeout(fire, 120); else fire();
   const dt = r ? (Date.now() - r.annT) : -1;
   log(`${a.name} 出手抢 ${id}（${why}）公告→发出 ${dt}ms`);
 }
@@ -133,6 +135,7 @@ function onEvent(a, o) {
     if (code !== '200' || !money) {
       log(`${a.name} 抢 ${o.id} 失败 code=${code} ${res.msg || ''}（${rtt}ms） → 本包结束`);
       r.done = true;
+      if (code === '500' || code === '510') { a.state = 'closed'; log(a.name + ' 座位失效，重新进房'); try { a.sock.write(JSON.stringify({ cmd: 'change' }) + '\n'); a.state = 'joined'; } catch (e) {} }
       return;
     }
     log(`${a.name} 抢到 ${o.id} = ${money.toFixed(2)}（${rtt}ms）`);
@@ -169,18 +172,25 @@ async function tryAlign() {
   if (live.length < 2) return;
   const cnt = {};
   live.forEach((a) => { cnt[a.room] = (cnt[a.room] || 0) + 1; });
-  const target = Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x])[0];
-  if (Object.keys(cnt).length === 1 && live.length === accs.length) {
-    if (!global.__aligned) { global.__aligned = true; log('★三号同桌完成 桌' + target); }
+  const rooms = Object.keys(cnt);
+  if (rooms.length === 1 && live.length === accs.length) {
+    if (!global.__aligned) { global.__aligned = true; log('★三号同桌完成 桌' + rooms[0]); }
     return;
   }
   global.__aligned = false;
+  // 目标 = 人最多的房间（平票取窗口1 的房间，再取数字大的）
+  const target = rooms.sort((x, y) => (cnt[y] - cnt[x]) || (String(accs[0].room) === x ? -1 : String(accs[0].room) === y ? 1 : Number(y) - Number(x)))[0];
+  if (global.__tgt !== target) { global.__tgt = target; global.__tries = {}; }
+  global.__tries = global.__tries || {};
   aligning = true;
   const out = live.filter((a) => String(a.room) !== String(target));
-  const one = out[out.length - 1];
-  log('同桌中：' + live.map((a) => a.name + '=' + a.room).join(' ') + ' → 拉 ' + one.name + ' 到 ' + target);
+  const cand = out.filter((a) => (global.__tries[a.name] || 0) < 8);
+  if (!cand.length) { log('对齐放弃：目标桌 ' + target + ' 连拉 8 次不中，换目标'); global.__tgt = null; global.__tries = {}; setTimeout(() => { aligning = false; }, 800); return; }
+  const one = cand[0];
+  global.__tries[one.name] = (global.__tries[one.name] || 0) + 1;
+  log('同桌中：' + live.map((a) => a.name + '=' + a.room).join(' ') + ' → 拉 ' + one.name + ' 到 ' + target + '（第' + global.__tries[one.name] + '次）');
   one.sock.write(JSON.stringify({ cmd: 'change' }) + '\n');
-  setTimeout(() => { aligning = false; }, 1200);
+  setTimeout(() => { aligning = false; }, 1000);
 }
 setInterval(() => { tryAlign().catch(() => {}); }, 2000);
 
